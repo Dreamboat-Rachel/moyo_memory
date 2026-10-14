@@ -54,6 +54,7 @@ from moyo_memory.semantic import (
     SemanticRecallService,
     create_semantic_recall_service,
 )
+from moyo_memory.security import verify_user_identity
 
 
 logger = logging.getLogger(__name__)
@@ -81,11 +82,19 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        repository.create_schema()
+        if settings.app_env == "development":
+            repository.create_schema()
         yield
         engine.dispose()
 
-    application = FastAPI(title=settings.app_name, version="0.2.0", lifespan=lifespan)
+    application = FastAPI(
+        title=settings.app_name,
+        version="0.2.0",
+        lifespan=lifespan,
+        docs_url=None if settings.app_env == "production" else "/docs",
+        redoc_url=None if settings.app_env == "production" else "/redoc",
+        openapi_url=None if settings.app_env == "production" else "/openapi.json",
+    )
     application.state.repository = repository
     application.state.memory_graph = graph
     application.state.semantic_retriever = semantic_retriever
@@ -93,22 +102,41 @@ def create_app(
     application.state.reranker = reranker
 
     def admin_key_matches(value: str | None) -> bool:
-        return bool(
-            value
-            and settings.auth_admin_key
-            and secrets.compare_digest(value, settings.auth_admin_key)
-        )
+        if not value or not settings.auth_admin_key:
+            return False
+        try:
+            return secrets.compare_digest(value, settings.auth_admin_key)
+        except TypeError:
+            return False
 
     def authorize_user(
         user_id: str,
         x_user_id: str | None = Header(default=None, alias="X-User-ID"),
+        x_user_timestamp: str | None = Header(default=None, alias="X-User-Timestamp"),
+        x_user_signature: str | None = Header(default=None, alias="X-User-Signature"),
         x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
     ) -> str:
         if not settings.auth_enabled:
             return user_id
         if admin_key_matches(x_admin_key):
             return "admin"
-        if x_user_id and secrets.compare_digest(x_user_id, user_id):
+        signed_identity_valid = (
+            not settings.auth_user_signing_key
+            or verify_user_identity(
+                user_id,
+                x_user_timestamp,
+                x_user_signature,
+                settings.auth_user_signing_key,
+                ttl_seconds=settings.auth_signature_ttl_seconds,
+            )
+        )
+        if (
+            x_user_id
+            and secrets.compare_digest(
+                x_user_id.encode("utf-8"), user_id.encode("utf-8")
+            )
+            and signed_identity_valid
+        ):
             return x_user_id
         raise HTTPException(status_code=403, detail="无权访问该用户的数据")
 
@@ -198,6 +226,27 @@ def create_app(
             "semantic_recall": "enabled" if semantic_retriever else "disabled",
         }
 
+    @application.get("/health/ready")
+    def readiness() -> dict[str, object]:
+        try:
+            repository.ping()
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail="数据库不可用") from exc
+        dependencies = {"database": "ok"}
+        checker = getattr(semantic_retriever, "healthcheck", None)
+        if checker is not None:
+            try:
+                checker()
+            except Exception as exc:
+                logger.warning("Semantic backend readiness check failed", exc_info=True)
+                raise HTTPException(status_code=503, detail="向量检索服务不可用") from exc
+            dependencies["semantic_backend"] = "ok"
+        elif semantic_retriever is not None:
+            dependencies["semantic_backend"] = "configured_unchecked"
+        else:
+            dependencies["semantic_backend"] = "disabled"
+        return {"status": "ready", "dependencies": dependencies}
+
     @application.get("/health/vector-index")
     def vector_index_health(
         _: str = Depends(authorize_admin),
@@ -211,9 +260,17 @@ def create_app(
     def extract_memory(
         request: IngestRequest,
         x_user_id: str | None = Header(default=None, alias="X-User-ID"),
+        x_user_timestamp: str | None = Header(default=None, alias="X-User-Timestamp"),
+        x_user_signature: str | None = Header(default=None, alias="X-User-Signature"),
         x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
     ) -> IngestResponse:
-        actor_id = authorize_user(request.user_id, x_user_id, x_admin_key)
+        actor_id = authorize_user(
+            request.user_id,
+            x_user_id=x_user_id,
+            x_user_timestamp=x_user_timestamp,
+            x_user_signature=x_user_signature,
+            x_admin_key=x_admin_key,
+        )
         try:
             state = graph.invoke({"request": request})
         except ModelNotConfigured as exc:

@@ -87,6 +87,9 @@ class QdrantVectorIndex:
         )
         self._collection_ready = False
 
+    def healthcheck(self) -> None:
+        self.client.get_collections()
+
     def _ensure_collection(self) -> None:
         if self._collection_ready:
             return
@@ -207,6 +210,11 @@ class SemanticRecallService:
         self._failure_count = 0
         self._open_until = 0.0
         self._lock = Lock()
+
+    def healthcheck(self) -> None:
+        checker = getattr(self.index, "healthcheck", None)
+        if checker is not None:
+            checker()
 
     def search(
         self,

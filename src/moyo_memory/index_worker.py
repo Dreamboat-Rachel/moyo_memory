@@ -106,7 +106,8 @@ def create_worker(settings: Settings) -> VectorIndexWorker:
     repository = MemoryRepository(
         create_db_engine(settings.database_url, echo=settings.sql_echo)
     )
-    repository.create_schema()
+    if settings.app_env == "development":
+        repository.create_schema()
     repository.recover_stale_vector_operations()
     embeddings, index = create_semantic_components(settings)
     return VectorIndexWorker(

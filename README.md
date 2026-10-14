@@ -76,6 +76,8 @@ RERANK_TIMEOUT_SECONDS=20
 # 生产环境开启。用户请求携带 X-User-ID，管理员请求携带 X-Admin-Key。
 AUTH_ENABLED=false
 AUTH_ADMIN_KEY=请生成高强度随机值
+AUTH_USER_SIGNING_KEY=
+AUTH_SIGNATURE_TTL_SECONDS=300
 
 # 一轮是一组 user/assistant 消息；轮数和 token 预算同时生效。
 CHAT_HISTORY_MAX_TURNS=12
@@ -86,6 +88,37 @@ CHAT_SUMMARY_ENABLED=true
 ```
 
 `.env` 已被 Git 忽略，不要把真实密钥写入 `.env.example` 或提交到版本库。后台记忆提取使用完整的结构化响应，不启用流式输出；这可以确保模型结果先通过 Pydantic 校验，再执行数据库操作。
+
+### 生产部署基线
+
+生产部署使用独立的 `compose.production.yml`，不会向宿主机发布 MySQL/Qdrant 端口，API 仅绑定到 `127.0.0.1:8000`，应由配置了 TLS 的反向代理接入。复制 `.env.production.example` 为 `.env.production`，为每个密钥生成不同的随机值，并限制该文件的系统访问权限：
+
+```bash
+docker compose --env-file .env.production -f compose.production.yml up -d --build
+```
+
+`APP_ENV=production` 会在启动时强制要求鉴权、至少 32 字符的管理员密钥和用户签名密钥、模型密钥、MySQL，以及启用语义召回时的 Qdrant API Key；生产模式不自动建表，并关闭在线 API 文档。部署前必须先备份数据库。全新数据库由迁移服务执行 `alembic upgrade head`；已有数据库不能直接执行初始迁移，只有确认当前表结构与迁移基线一致后，才可在维护窗口执行 `alembic stamp head`。之后每次表结构变更都应提交新的迁移并先在备份副本上演练。
+
+API 用户身份不能只靠客户端自行填写 `X-User-ID`。应由受信任的后端/BFF 在认证用户后计算签名，并转发以下三个请求头；签名密钥不得放在浏览器或移动端：
+
+```python
+import hashlib
+import hmac
+import time
+
+timestamp = str(int(time.time()))
+message = f"{user_id}:{timestamp}".encode("utf-8")
+signature = hmac.new(USER_SIGNING_KEY.encode("utf-8"), message, hashlib.sha256).hexdigest()
+headers = {
+    "X-User-ID": user_id,
+    "X-User-Timestamp": timestamp,
+    "X-User-Signature": signature,
+}
+```
+
+该签名默认 5 分钟过期。反向代理还必须覆盖并清除客户端传入的身份头，限制请求体大小和频率，并终止 TLS。当前 Compose 文件提供容器重启、健康检查和持久卷，但**不会自动备份加密的 MySQL/Qdrant 数据，也不替代密钥管理、备份恢复演练、监控告警或隐私合规评估**；这些仍须按实际生产环境接入和验收。
+
+可从 [`deploy/nginx.conf.example`](deploy/nginx.conf.example) 开始配置 TLS、每 IP 限流、请求体限制和个人数据禁缓存。示例假设 Nginx 与 Compose 部署在同一台主机；若 Nginx 位于负载均衡器后，必须仅信任明确配置的代理地址来恢复真实客户端 IP。内置 `/chat` 和 `/graph` 页面是本地调试界面，不是带登录态的生产前端；生产产品界面应由已认证的 BFF 调用这些 API。
 
 `EMBEDDING_API_KEY` 留空时复用 `MODEL_API_KEY`。启用语义检索前必须确认模型服务支持 OpenAI 兼容的 `/embeddings` 接口，且返回维度与 `EMBEDDING_DIMENSIONS` 一致。
 
@@ -195,12 +228,41 @@ curl "http://127.0.0.1:8000/v1/users/user-001/conversations/会话ID?limit=100"
 - `GET /v1/users/{user_id}/memories?include_history=true`：查看记忆历史。
 - `DELETE /v1/users/{user_id}/memories`：物理删除该用户的会话、消息和长期记忆。
 - `GET /health`：服务与数据库健康检查。
+- `GET /health/ready`：部署就绪检查；数据库或已配置的 Qdrant 不可用时返回 503。
 - `GET /health/vector-index`：查看向量索引开关和 outbox 积压。
 - `GET /health/metrics`：管理员查看全局记忆与索引状态。
 
-启用鉴权后，用户接口需携带 `X-User-ID`。`GET /v1/users`、
-`GET /health/vector-index` 和 `GET /health/metrics` 属于管理员接口，需要
-`X-Admin-Key`。本地 `AUTH_ENABLED=false` 时保持原有调用方式不变。
+本地 `AUTH_ENABLED=false` 时保持原有调用方式不变。开启鉴权后，管理接口
+`GET /v1/users`、`GET /health/vector-index` 和 `GET /health/metrics` 需要
+`X-Admin-Key`。生产模式的用户接口需要 `X-User-ID`、`X-User-Timestamp` 和
+`X-User-Signature`；签名规则见上方生产部署说明。只有可信后端/BFF 才应持有签名密钥，
+不能将它写入浏览器页面或移动客户端。
+
+## 外部对话系统接入
+
+如果你的产品已经有自己的对话模型，通常由你的后端按“召回 -> 生成回答 -> 提取新记忆”的顺序处理。召回和提取相互独立：不能因为本轮没有旧记忆命中就跳过提取，也通常不需要先提取再查旧记忆。
+
+1. **用用户问题查已有记忆。** 调用 `POST /v1/users/{user_id}/recall`，请求体的 `query` 放用户当前问题。读取响应中的 `hits` 或 `context`；没有相关记忆时它们为空，这是正常情况。
+
+   ```bash
+   curl -X POST http://127.0.0.1:8000/v1/users/user-001/recall \
+     -H "Content-Type: application/json" \
+     -d '{"query":"我平时喜欢做什么？","limit":5}'
+   ```
+
+2. **由你自己的模型回答。** 将用户当前问题和召回到的 `context` 一起交给你的对话模型。如果 `context` 为空，就只根据当前问题及你自己的对话上下文回答；Moyo 的召回接口本身不生成回答。
+
+3. **从用户原话提取新记忆。** 回答完成后（也可以交给可靠的后台任务），调用 `POST /v1/memories/extract`，将本轮用户原话放在 `content` 中。提取流程会判断是否有值得长期保留的信息；普通闲聊或一次性问题可以不产生记忆。应提取用户原话，不要把模型生成的回答当成用户事实保存。
+
+   ```bash
+   curl -X POST http://127.0.0.1:8000/v1/memories/extract \
+     -H "Content-Type: application/json" \
+     -d '{"user_id":"user-001","message_id":"msg-唯一ID","content":"我最近开始学钢琴"}'
+   ```
+
+   `message_id` 应由你的后端为这条用户消息生成唯一且稳定的 ID；重试同一请求时复用原 ID。生产环境两个接口都要由可信后端/BFF 附加用户身份签名头，不能让浏览器直接持有签名密钥。
+
+如果一句话既包含新信息又提出问题，例如“我刚搬到杭州，附近有什么徒步路线？”，可以把整条用户原话交给提取接口保存；回答当前问题时也应把“刚搬到杭州”直接作为本轮上下文，不能依赖新记忆已经完成向量索引。项目内置的 `/conversations/.../messages` 是端到端测试入口，会自动执行召回、回答、保存对话和记忆提取；由你自己的模型回答时，不要再调用该测试聊天接口，以免重复生成回答。
 
 ## 知识召回
 
