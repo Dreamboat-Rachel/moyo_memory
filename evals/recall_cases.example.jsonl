@@ -1,0 +1,3 @@
+{"user_id":"user-001","query":"我叫什么名字？","relevant_fact_ids":["替换为name事实ID"]}
+{"user_id":"user-001","query":"我平时有哪些爱好？","relevant_fact_ids":["替换为hobby事实ID"]}
+{"user_id":"user-001","query":"今天北京天气怎么样？","relevant_fact_ids":[],"expect_empty":true}

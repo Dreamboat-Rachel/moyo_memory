@@ -1,0 +1,8 @@
+2026-10-14 14:29:06,575 INFO __main__ Vector index worker started
+2026-10-14 14:29:07,250 INFO httpx HTTP Request: GET http://127.0.0.1:6333 "HTTP/1.1 200 OK"
+2026-10-14 14:46:58,439 INFO httpx HTTP Request: GET http://127.0.0.1:6333/collections/moyo_memory_facts_v1/exists "HTTP/1.1 200 OK"
+2026-10-14 14:46:58,450 INFO httpx HTTP Request: GET http://127.0.0.1:6333/collections/moyo_memory_facts_v1 "HTTP/1.1 200 OK"
+2026-10-14 14:46:58,482 INFO httpx HTTP Request: POST http://127.0.0.1:6333/collections/moyo_memory_facts_v1/points/delete?wait=true "HTTP/1.1 200 OK"
+2026-10-14 14:46:58,715 INFO httpx HTTP Request: POST https://maas.qianwenaiapi.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-10-14 14:46:58,752 INFO httpx HTTP Request: PUT http://127.0.0.1:6333/collections/moyo_memory_facts_v1/points?wait=true "HTTP/1.1 200 OK"
+2026-10-14 14:47:57,966 INFO httpx HTTP Request: POST http://127.0.0.1:6333/collections/moyo_memory_facts_v1/points/delete?wait=true "HTTP/1.1 200 OK"
